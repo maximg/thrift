@@ -17,86 +17,102 @@
  * under the License.
  */
 
+#[macro_use]
 extern crate thrift;
+extern crate bufstream;
 
 mod tutorial;
 mod shared;
 
-use std::net;
-use std::rc::Rc;
+use std::io;
+use std::net::{TcpListener, TcpStream};
 use std::cell::RefCell;
-use std::str::FromStr;
 use std::collections::HashMap;
 
 use thrift::protocol::binary_protocol::BinaryProtocol;
 use thrift::server::SimpleServer;
+use thrift::transport::server::TransportServer;
 
-use tutorial::{Operation, Work, CalculatorProcessor, CalculatorIf};
-use shared::{SharedStruct, SharedServiceIf};
+use tutorial::*;
+use shared::*;
 
-#[allow(dead_code)]
+use bufstream::BufStream;
+
 struct CalculatorHandler {
-    log: HashMap<i32, SharedStruct>
+    log: RefCell<HashMap<i32, SharedStruct>>
 }
 
-#[allow(dead_code)]
-impl CalculatorIf for CalculatorHandler {
-    fn ping(&mut self) {
+impl<'a> Calculator for &'a CalculatorHandler {
+    fn ping(&self) -> CalculatorPingResult {
         println!("ping()");
+        CalculatorPingResult { success: Some(()) }
     }
 
-    fn add(&mut self, n1: i32, n2: i32) -> i32 {
+    fn add(&self, n1: i32, n2: i32) -> CalculatorAddResult {
         println!("add({}, {})", n1, n2);
-        n1 + n2
+        CalculatorAddResult { success: Some(n1 + n2) }
     }
 
-    fn calculate(&mut self, log_id: i32, work: Work) -> i32 {
+    fn calculate(&self, log_id: i32, work: Work) -> CalculatorCalculateResult {
         println!("calculate({}, {:?})", log_id, work);
 
-        let val = match work.op {
-            Operation::ADD => work.num1 + work.num2,
-            Operation::SUBTRACT => work.num1 - work.num2,
-            Operation::MULTIPLY => work.num1 * work.num2,
+        let num1 = work.num1.unwrap();
+        let num2 = work.num2.unwrap();
+
+        let val = match work.op.unwrap() {
+            Operation::ADD => num1 + num2,
+            Operation::SUBTRACT => num1 - num2,
+            Operation::MULTIPLY => num1 * num2,
             Operation::DIVIDE => {
-                if work.num2 == 0 {
-                    // TODO: Add this back in when exceptions are implemented
-                    //InvalidOperation { what: work.op, why: "Cannot divide by 0".to_owned() };
-                    unimplemented!()
+                if num2 == 0 {
+                    return CalculatorCalculateResult {
+                        success: None,
+                        ouch: Some(InvalidOperation {
+                            what_op: work.op.map(|x| x as i32),
+                            why: Some("Cannot divide by 0".into())
+                        })
+                    };
                 }
-                work.num1 / work.num2
+
+                num1 / num2
             }
         };
 
-        let ss = SharedStruct { key: log_id, value: val.to_string() };
-        self.log.insert(log_id, ss);
+        let ss = SharedStruct { key: Some(log_id), value: Some(val.to_string()) };
+        self.log.borrow_mut().insert(log_id, ss);
 
-        val
+        CalculatorCalculateResult { success: Some(val), ouch: None }
     }
 
-    fn zip(&mut self) {
+    fn zip(&self) -> CalculatorZipResult {
         println!("zip");
+        CalculatorZipResult { success: Some(()) }
     }
 }
 
-impl SharedServiceIf for CalculatorHandler {
-    fn getStruct(&mut self, log_id: i32) -> SharedStruct {
+impl<'a> SharedService for &'a CalculatorHandler {
+    fn getStruct(&self, log_id: i32) -> SharedServiceGetStructResult {
         println!("getStruct({})", log_id);
-        self.log[&log_id].clone()
+        SharedServiceGetStructResult { success: Some(self.log.borrow()[&log_id].clone()) }
     }
 }
 
-fn construct_protocol() -> BinaryProtocol {
-    BinaryProtocol
+struct BufferServer(TcpListener);
+
+impl TransportServer for BufferServer {
+     type Transport = BufStream<TcpStream>;
+
+     fn accept(&self) -> io::Result<BufStream<TcpStream>> {
+        self.0.accept().map(|res| BufStream::new(res.0))
+     }
 }
 
 pub fn main() {
-    let handler = CalculatorHandler { log: HashMap::new() };
-    let processor = CalculatorProcessor::new(Rc::new(RefCell::new(handler)));
+    let handler = CalculatorHandler { log: RefCell::new(HashMap::new()) };
+    let processor = CalculatorProcessor::new(&handler, &handler);
 
-    let addr: net::SocketAddr = FromStr::from_str("127.0.0.1:9090").ok()
-        .expect("bad server address");
-    let server_transport = net::TcpListener::bind(addr).unwrap();
-    let mut server = SimpleServer::new(processor, server_transport, construct_protocol);
+    let server_transport = BufferServer(TcpListener::bind("127.0.0.1:9090").unwrap());
+    let mut server = SimpleServer::new(processor, server_transport, || BinaryProtocol);
 
     println!("Starting the server...");
     server.serve();
